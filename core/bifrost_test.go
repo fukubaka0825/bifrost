@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/maximhq/bifrost/core/internal/memtest"
 	"github.com/maximhq/bifrost/core/keyselectors"
 	mistralprovider "github.com/maximhq/bifrost/core/providers/mistral"
@@ -7002,4 +7003,45 @@ func TestScenarioKeyBindingsArePerModel(t *testing.T) {
 	})
 	requireSessionState(t, kv, "s", SessionStateKindKey, provA, "m", "a1")
 	requireSessionState(t, kv, "s", SessionStateKindKey, provA, "m2", "a2")
+}
+
+// TestSetMCPInProcessServerFactory_RacesLazyManagerCreation: the HTTP transport
+// registers the openapi factory after Init, while a request may be lazily
+// creating the MCP manager. Whichever wins, the manager that ends up serving
+// must carry the factory, and the registration must not race the creation.
+func TestSetMCPInProcessServerFactory_RacesLazyManagerCreation(t *testing.T) {
+	factory := func(context.Context, *schemas.MCPClientConfig, schemas.InProcessServerDeps) (*server.MCPServer, error) {
+		return server.NewMCPServer("stub-openapi", "1.0.0", server.WithToolCapabilities(false)), nil
+	}
+	openAPIClient := func(name string) *schemas.MCPClientConfig {
+		return &schemas.MCPClientConfig{
+			ID:             name + "-id",
+			Name:           name,
+			ConnectionType: schemas.MCPConnectionTypeOpenAPI,
+			ToolsToExecute: schemas.WhiteList{"*"},
+			OpenAPIConfig:  &schemas.MCPOpenAPIConfig{Spec: "unused by the stub"},
+		}
+	}
+	for i := 0; i < 20; i++ {
+		// No MCPConfig: the manager is created lazily by the first MCP call.
+		b, err := Init(context.Background(), schemas.BifrostConfig{Account: NewMockAccount(), Logger: NewNoOpLogger()})
+		if err != nil {
+			t.Fatalf("Init failed: %v", err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			b.SetMCPInProcessServerFactory(factory)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = b.AddMCPClient(context.Background(), openAPIClient("first"))
+		}()
+		wg.Wait()
+		if err := b.AddMCPClient(context.Background(), openAPIClient("second")); err != nil {
+			t.Fatalf("iteration %d: the manager lost the registered factory: %v", i, err)
+		}
+		b.Shutdown()
+	}
 }
