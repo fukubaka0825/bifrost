@@ -1,6 +1,7 @@
 import type {
 	MCPOpenAPIConfig,
 	MCPOpenAPICredential,
+	MCPOpenAPIPreviewRequest,
 	MCPOpenAPIPreviewResponse,
 	MCPOpenAPIPreviewTool,
 	MCPOpenAPISecurityScheme,
@@ -338,4 +339,44 @@ export async function readUploadedSpec(file: {
 export function openAPIBaseUrlRequired(choice: "server" | "custom", preview: MCPOpenAPIPreviewResponse | null | undefined): boolean {
 	if (choice === "custom") return true;
 	return (preview?.servers?.length ?? 0) === 0 && !preview?.operation_servers;
+}
+
+/**
+ * Whether the edit sheet's spec replacement holds changes worth saving: an open
+ * replacement with a parsed preview or edited credentials. It lives outside the
+ * form, so the sheet adds it to the form's own dirty state.
+ */
+export function replacementIsDirty(r: { open: boolean; preview: MCPOpenAPIPreviewResponse | null; credentialsDirty: boolean }): boolean {
+	return r.open && (!!r.preview || r.credentialsDirty);
+}
+
+/**
+ * The auto-execute list to save with a replaced document's tool selection: an
+ * entry survives only if its tool is still offered and selected, and "*" only
+ * while every tool is selected. The server refuses auto-execute entries outside
+ * tools_to_execute.
+ */
+export function replacementAutoExecute(autoExecute: string[] | undefined, supported: string[], toolsToExecute: string[]): string[] {
+	const all = toolsToExecute.includes("*");
+	return (autoExecute ?? []).filter((name) => (name === "*" ? all : supported.includes(name) && (all || toolsToExecute.includes(name))));
+}
+
+/**
+ * The preview request for the edit sheet's replacement source. It carries the
+ * stored include_deprecated and the client's name, so the picker offers the
+ * tools the saved server will build under the names an update accepts.
+ */
+export function replacePreviewRequest(
+	mode: OpenAPISourceMode,
+	specText: string,
+	specUrl: string,
+	customBase: string | undefined,
+	includeDeprecated: boolean | undefined,
+	clientName?: string,
+): MCPOpenAPIPreviewRequest {
+	const req: MCPOpenAPIPreviewRequest =
+		mode === "url" ? { spec_url: specUrl.trim(), base_url: customBase } : { spec: specText, base_url: customBase };
+	if (includeDeprecated) req.include_deprecated = true;
+	if (clientName?.trim()) req.client_name = clientName.trim();
+	return req;
 }

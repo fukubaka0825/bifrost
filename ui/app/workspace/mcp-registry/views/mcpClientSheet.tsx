@@ -35,9 +35,28 @@ import {
 	useGetCoreConfigQuery,
 	useGetVirtualKeysQuery,
 	useGetVirtualMCPsQuery,
+	useLazyGetMCPClientOpenAPISpecQuery,
+	usePreviewOpenAPISpecMutation,
 	useUpdateMCPClientMutation,
 } from "@/lib/store";
-import { MCPClient, MCPVKConfig } from "@/lib/types/mcp";
+import { MCPClient, MCPOpenAPICredential, MCPOpenAPIPreviewResponse, MCPVKConfig, SecretVar } from "@/lib/types/mcp";
+import {
+	applyParsedPreview,
+	buildOpenAPIConfigPayload,
+	openAPIBaseUrlRequired,
+	collapseToolSelection,
+	reconcileToolSelection,
+	replacePreviewRequest,
+	replacementAutoExecute,
+	replacementIsDirty,
+	specFingerprint,
+	summarizeSpecSource,
+	supportedToolNames,
+	type OpenAPICredentialField,
+	type OpenAPISourceMode,
+} from "./mcpClientOpenApiUtils";
+import { OpenAPIPreviewPanel, type OpenAPIBaseUrlChoice } from "./openApiPreviewPanel";
+import { OpenAPISpecSource } from "./openApiSpecSource";
 import { VirtualMCP } from "@/lib/types/virtualMcps";
 import { mcpClientUpdateSchema, type MCPClientUpdateSchema } from "@/lib/types/schemas";
 import { parseArrayFromText } from "@/lib/utils/array";
@@ -49,7 +68,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { Check, ChevronDown, ChevronRight, Copy, Info, Plus, Trash2 } from "lucide-react";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { getExternalBaseUrl } from "@/app/workspace/mcp-registry/views/mcpUsageGuide/utils";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { OAuthAdvancedFields } from "./oauthAdvancedFields";
 import { OAuth2Authorizer } from "./oauth2Authorizer";
@@ -262,6 +281,113 @@ export default function MCPClientSheet({
 	);
 	const supportsOAuthCredentialUpdate = mcpClient.config.auth_type === "oauth" || mcpClient.config.auth_type === "per_user_oauth";
 	const supportsTokenExchangeCredentialUpdate = mcpClient.config.auth_type === "token_exchange";
+
+	// OpenAPI-backed servers: the stored document can be replaced from the
+	// General tab. The replacement is parsed through the same preview endpoint
+	// the create sheet uses; the existing tool selection is carried over by
+	// name, and openapi_config is only sent when a replacement was parsed.
+	const isOpenAPIClient = mcpClient.config.connection_type === "openapi";
+	const [replaceSpecOpen, setReplaceSpecOpen] = useState(false);
+	const [replaceSourceMode, setReplaceSourceMode] = useState<OpenAPISourceMode>("paste");
+	const [replaceSpecText, setReplaceSpecText] = useState("");
+	const [replaceSpecUrl, setReplaceSpecUrl] = useState(mcpClient.config.openapi_config?.spec_url ?? "");
+	const [replaceFileName, setReplaceFileName] = useState<string | null>(null);
+	const [replacePreview, setReplacePreview] = useState<MCPOpenAPIPreviewResponse | null>(null);
+	const [replaceFingerprint, setReplaceFingerprint] = useState<string | null>(null);
+	const [replaceParseError, setReplaceParseError] = useState<string | null>(null);
+	const [replaceBaseUrlChoice, setReplaceBaseUrlChoice] = useState<OpenAPIBaseUrlChoice>("custom");
+	const [replaceBaseUrl, setReplaceBaseUrl] = useState(mcpClient.config.openapi_config?.base_url ?? "");
+	const [replaceCredentials, setReplaceCredentials] = useState<Record<string, MCPOpenAPICredential>>(
+		mcpClient.config.openapi_config?.security_credentials ?? {},
+	);
+	const [replaceCredentialsDirty, setReplaceCredentialsDirty] = useState(false);
+	const [replaceSelection, setReplaceSelection] = useState<string[]>([]);
+	const [previewOpenAPISpec, { isLoading: isParsingReplaceSpec }] = usePreviewOpenAPISpecMutation();
+	const [fetchStoredOpenAPISpec] = useLazyGetMCPClientOpenAPISpecQuery();
+
+	// Bumped whenever the replacement draft is reset or edited, so a stored
+	// document that arrives late cannot overwrite a newer draft, a cancelled
+	// replacement, or another client's editor.
+	const replaceDraftToken = useRef(0);
+
+	const resetReplaceSpec = useCallback(() => {
+		replaceDraftToken.current++;
+		setReplaceSpecOpen(false);
+		setReplaceSourceMode("paste");
+		setReplaceSpecText("");
+		setReplaceSpecUrl(mcpClient.config.openapi_config?.spec_url ?? "");
+		setReplaceFileName(null);
+		setReplacePreview(null);
+		setReplaceFingerprint(null);
+		setReplaceParseError(null);
+		setReplaceBaseUrlChoice("custom");
+		setReplaceBaseUrl(mcpClient.config.openapi_config?.base_url ?? "");
+		setReplaceCredentials(mcpClient.config.openapi_config?.security_credentials ?? {});
+		setReplaceCredentialsDirty(false);
+		setReplaceSelection([]);
+	}, [mcpClient.config.openapi_config]);
+
+	useEffect(() => {
+		resetReplaceSpec();
+	}, [mcpClient.config.client_id, resetReplaceSpec]);
+
+	const openReplaceSpec = async () => {
+		setReplaceSpecOpen(true);
+		if (replaceSpecText) return;
+		const token = ++replaceDraftToken.current;
+		try {
+			const stored = await fetchStoredOpenAPISpec(mcpClient.config.client_id).unwrap();
+			if (token === replaceDraftToken.current) setReplaceSpecText(stored);
+		} catch {
+			// A spec_url-only client stores no document; the editor starts empty.
+		}
+	};
+
+	const handleReplaceParse = async () => {
+		// A response that arrives after a cancel, a client switch or a draft edit
+		// describes a source the editor no longer shows; drop it.
+		const token = replaceDraftToken.current;
+		setReplaceParseError(null);
+		const customBase = replaceBaseUrlChoice === "custom" && replaceBaseUrl.trim() ? replaceBaseUrl.trim() : undefined;
+		const requestedName = replaceClientName;
+		try {
+			const response = await previewOpenAPISpec(
+				replacePreviewRequest(
+					replaceSourceMode,
+					replaceSpecText,
+					replaceSpecUrl,
+					customBase,
+					mcpClient.config.openapi_config?.include_deprecated,
+					requestedName,
+				),
+			).unwrap();
+			if (token !== replaceDraftToken.current) return;
+			const latest = replaceLatest.current;
+			const nextSupported = supportedToolNames(response);
+			const previousAll = latest.preview ? supportedToolNames(latest.preview) : allToolNames;
+			const previousSelection = latest.preview ? latest.selection : (form.getValues("tools_to_execute") ?? []);
+			setReplaceSelection(reconcileToolSelection(previousSelection, previousAll, nextSupported));
+			// Same base-URL rules as the create sheet: a typed override or a server
+			// the document still lists is kept, an operation-servers document needs none.
+			const nextBase = applyParsedPreview(
+				{ selection: [], baseUrl: latest.baseUrl, baseUrlChoice: latest.baseUrlChoice, credentials: {} },
+				null,
+				response,
+			);
+			setReplaceBaseUrlChoice(nextBase.baseUrlChoice);
+			setReplaceBaseUrl(nextBase.baseUrl);
+			setReplacePreview(response);
+			setReplaceFingerprint(specFingerprint(replaceSourceMode, replaceSpecText, replaceSpecUrl, requestedName));
+		} catch (error) {
+			if (token !== replaceDraftToken.current) return;
+			setReplaceParseError(getErrorMessage(error));
+		}
+	};
+
+	const handleReplaceCredentialChange = (scheme: string, field: OpenAPICredentialField, value: SecretVar) => {
+		setReplaceCredentials((prev) => ({ ...prev, [scheme]: { ...(prev[scheme] ?? {}), [field]: value } }));
+		setReplaceCredentialsDirty(true);
+	};
 	// Entra's on-behalf-of grant requires use_idp_credentials — see the
 	// Prerequisites warning in docs/mcp/auth/token-exchange.mdx for why a
 	// dedicated exchange app structurally can't work there.
@@ -351,6 +477,28 @@ export default function MCPClientSheet({
 				: undefined,
 		},
 	});
+
+	const replaceClientName = form.watch("name") || mcpClient.config.name;
+	const replacePreviewCurrent =
+		!!replacePreview && replaceFingerprint === specFingerprint(replaceSourceMode, replaceSpecText, replaceSpecUrl, replaceClientName);
+	// Once a replacement is parsed, its operation picker owns the tool selection
+	// that gets saved, so the Tools tab is read-only until it is saved or cancelled.
+	const replacementOwnsTools = replaceSpecOpen && !!replacePreview;
+
+	// The latest picker choices, read when a parse response arrives so a choice
+	// made while the request was in flight is not overwritten by the older one.
+	const replaceLatest = useRef({
+		preview: replacePreview,
+		selection: replaceSelection,
+		baseUrl: replaceBaseUrl,
+		baseUrlChoice: replaceBaseUrlChoice,
+	});
+	replaceLatest.current = {
+		preview: replacePreview,
+		selection: replaceSelection,
+		baseUrl: replaceBaseUrl,
+		baseUrlChoice: replaceBaseUrlChoice,
+	};
 	const isDisabled = form.watch("disabled");
 	const needsSessionStickiness = form.watch("needs_session_stickiness");
 
@@ -408,7 +556,12 @@ export default function MCPClientSheet({
 	const oauthScopesDirty = oauthScopesRaw !== initialOauthScopesRaw;
 	const initialTokenExchangeScopesRaw = (mcpClient.config.token_exchange?.scopes || []).join(", ");
 	const tokenExchangeScopesDirty = tokenExchangeScopesRaw !== initialTokenExchangeScopesRaw;
-	const isDirty = form.formState.isDirty || vkConfigsDirty || oauthScopesDirty || tokenExchangeScopesDirty;
+	const isDirty =
+		form.formState.isDirty ||
+		vkConfigsDirty ||
+		oauthScopesDirty ||
+		tokenExchangeScopesDirty ||
+		replacementIsDirty({ open: replaceSpecOpen, preview: replacePreview, credentialsDirty: replaceCredentialsDirty });
 	// dirtyFields tracks deep changes vs. the pre-populated default values —
 	// used both to gate the rotation warning below and, in onSubmit, to only
 	// rotate when the user actually changed a field. Every oauth_config field
@@ -468,6 +621,58 @@ export default function MCPClientSheet({
 				});
 				return;
 			}
+			// A replacement document must have been parsed (and not edited since)
+			// and must keep at least one operation, so the server is never left
+			// with a tool list nobody reviewed.
+			const replacingSpec = isOpenAPIClient && replaceSpecOpen;
+			if (replacingSpec) {
+				if (!replacePreviewCurrent) {
+					toast({
+						title: "Parse the replacement spec first",
+						description: "Parse the document so its operations can be reviewed before it replaces the current one.",
+						variant: "destructive",
+					});
+					return;
+				}
+				const supported = supportedToolNames(replacePreview);
+				if (!replaceSelection.some((name) => supported.includes(name))) {
+					toast({
+						title: "Select at least one operation",
+						description: "Tick the operations this server should expose as tools.",
+						variant: "destructive",
+					});
+					return;
+				}
+				if (openAPIBaseUrlRequired(replaceBaseUrlChoice, replacePreview) && !replaceBaseUrl.trim()) {
+					toast({
+						title: "Base URL is required",
+						description: "The document declares no absolute server URL; provide the upstream base URL.",
+						variant: "destructive",
+					});
+					return;
+				}
+			}
+			const replaceSupported = replacingSpec ? supportedToolNames(replacePreview) : null;
+			const resolvedToolsToExecute = replaceSupported ? collapseToolSelection(replaceSelection, replaceSupported) : data.tools_to_execute;
+			const resolvedToolsToAutoExecute = replaceSupported
+				? replacementAutoExecute(data.tools_to_auto_execute, replaceSupported, resolvedToolsToExecute ?? [])
+				: data.tools_to_auto_execute;
+			const openapiReplacePayload = replacingSpec
+				? buildOpenAPIConfigPayload(
+						{
+							spec: replaceSpecText,
+							spec_url: replaceSpecUrl,
+							base_url: replaceBaseUrl,
+							// Untouched credentials are omitted so the server keeps the stored
+							// secrets; edited ones are sent (a redacted value also keeps the stored one).
+							security_credentials: replaceCredentialsDirty ? replaceCredentials : undefined,
+							include_deprecated: mcpClient.config.openapi_config?.include_deprecated,
+							max_response_bytes: mcpClient.config.openapi_config?.max_response_bytes,
+						},
+						replaceSourceMode,
+						replacePreview,
+					)
+				: undefined;
 			const oauthClientID = data.oauth_config?.client_id;
 			const oauthClientSecret = data.oauth_config?.client_secret;
 			// Omitted (undefined) preserves the stored scopes; an explicit
@@ -515,8 +720,8 @@ export default function MCPClientSheet({
 					disabled: data.disabled,
 					headers: data.headers ?? {},
 					per_user_header_keys: mcpClient.config.auth_type === "per_user_headers" ? data.per_user_header_keys : undefined,
-					tools_to_execute: data.tools_to_execute,
-					tools_to_auto_execute: data.tools_to_auto_execute,
+					tools_to_execute: resolvedToolsToExecute,
+					tools_to_auto_execute: resolvedToolsToAutoExecute,
 					tool_pricing: data.tool_pricing,
 					// Sent only when edited: PUT has PATCH semantics, and the
 					// nanoseconds-to-minutes normalization is lossy for a sub-minute
@@ -557,8 +762,10 @@ export default function MCPClientSheet({
 								}
 							: undefined,
 					vk_configs: vkConfigsDirty ? vkConfigs : undefined,
+					openapi_config: openapiReplacePayload,
 				},
 			}).unwrap();
+			if (replacingSpec) resetReplaceSpec();
 
 			toast({
 				title: "Success",
@@ -776,19 +983,111 @@ export default function MCPClientSheet({
 															? "STDIO"
 															: mcpClient.config.connection_type === "sse"
 																? "SSE"
-																: "HTTP"}
+																: mcpClient.config.connection_type === "openapi"
+																	? "OPENAPI"
+																	: "HTTP"}
 													</span>
 													<span className="mx-2">·</span>
 													<span className="font-mono break-all">
 														{mcpClient.config.connection_type === "stdio"
 															? `${mcpClient.config.stdio_config?.command ?? ""} ${(mcpClient.config.stdio_config?.args ?? []).join(" ")}`.trim() ||
 																"-"
-															: mcpClient.config.connection_string?.type === "env" || mcpClient.config.connection_string?.type === "vault"
-																? mcpClient.config.connection_string.ref
-																: mcpClient.config.connection_string?.value || "-"}
+															: mcpClient.config.connection_type === "openapi"
+																? mcpClient.config.openapi_config?.base_url || "base URL from the document's servers"
+																: mcpClient.config.connection_string?.type === "env" || mcpClient.config.connection_string?.type === "vault"
+																	? mcpClient.config.connection_string.ref
+																	: mcpClient.config.connection_string?.value || "-"}
 													</span>
 												</div>
 											</div>
+											{isOpenAPIClient && (
+												<div className="space-y-3" data-testid="mcp-client-sheet-openapi-section">
+													<div className="flex items-start justify-between gap-3">
+														<div className="text-sm font-medium">OpenAPI document</div>
+														{!replaceSpecOpen && (
+															<Button
+																type="button"
+																variant="outline"
+																size="sm"
+																disabled={!hasUpdateMCPClientAccess}
+																onClick={() => void openReplaceSpec()}
+																data-testid="openapi-replace-spec-btn"
+															>
+																Replace spec
+															</Button>
+														)}
+													</div>
+													<div
+														className="bg-muted/40 text-muted-foreground rounded-md border px-3 py-2 text-sm break-words"
+														data-testid="mcp-client-sheet-openapi-summary"
+													>
+														{summarizeSpecSource(mcpClient.config.openapi_config)}
+													</div>
+													{replaceSpecOpen && (
+														<div className="space-y-4 rounded-md border p-3" data-testid="openapi-replace-spec-panel">
+															<p className="text-muted-foreground text-xs">
+																Paste, upload or point at the new document and parse it. Operations that keep their name stay selected; the
+																server is rebuilt from the new document when you save.
+															</p>
+															<OpenAPISpecSource
+																compact
+																mode={replaceSourceMode}
+																onModeChange={(mode) => {
+																	replaceDraftToken.current++;
+																	setReplaceSourceMode(mode);
+																	setReplaceParseError(null);
+																}}
+																specText={replaceSpecText}
+																onSpecTextChange={(text) => {
+																	replaceDraftToken.current++;
+																	setReplaceSpecText(text);
+																}}
+																specUrl={replaceSpecUrl}
+																onSpecUrlChange={(url) => {
+																	replaceDraftToken.current++;
+																	setReplaceSpecUrl(url);
+																}}
+																fileName={replaceFileName}
+																onFileSelected={(file, text) => {
+																	replaceDraftToken.current++;
+																	setReplaceFileName(file.name);
+																	setReplaceSpecText(text);
+																}}
+																onParse={() => void handleReplaceParse()}
+																isParsing={isParsingReplaceSpec}
+																parseError={replaceParseError}
+																isStale={!!replacePreview && !replacePreviewCurrent}
+																disabled={!hasUpdateMCPClientAccess}
+															/>
+															{replacePreview && (
+																<OpenAPIPreviewPanel
+																	preview={replacePreview}
+																	baseUrlChoice={replaceBaseUrlChoice}
+																	onBaseUrlChoiceChange={setReplaceBaseUrlChoice}
+																	baseUrl={replaceBaseUrl}
+																	onBaseUrlChange={setReplaceBaseUrl}
+																	credentials={replaceCredentials}
+																	onCredentialChange={handleReplaceCredentialChange}
+																	selectedTools={replaceSelection}
+																	onSelectedToolsChange={setReplaceSelection}
+																	disabled={!hasUpdateMCPClientAccess}
+																/>
+															)}
+															<div className="flex justify-end">
+																<Button
+																	type="button"
+																	variant="ghost"
+																	size="sm"
+																	onClick={resetReplaceSpec}
+																	data-testid="openapi-replace-cancel-btn"
+																>
+																	Cancel replace
+																</Button>
+															</div>
+														</div>
+													)}
+												</div>
+											)}
 											{mcpClient.config.endpoint_slug && (
 												<div className="flex flex-col gap-2">
 													<div className="text-sm font-medium">Endpoint</div>
@@ -1433,7 +1732,19 @@ export default function MCPClientSheet({
 										})()}
 									</TabsContent>
 
-									<TabsContent value="tools" className="space-y-6 pb-10">
+									<TabsContent value="tools" className="space-y-6 pb-10" inert={replacementOwnsTools}>
+										{replacementOwnsTools && (
+											<div
+												className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800"
+												data-testid="mcp-client-tools-replacement-note"
+											>
+												<Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+												<p>
+													A replacement document is open on the General tab, and its operation list decides which tools are saved. Save or
+													cancel the replacement to edit tools here.
+												</p>
+											</div>
+										)}
 										<div className="space-y-4">
 											<div className="flex items-start justify-between gap-4">
 												<SectionHeader
