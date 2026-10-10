@@ -9,13 +9,34 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { IS_ENTERPRISE } from "@/lib/constants/config";
-import { CreateMCPClientRequest, MCPAuthType, MCPConnectionType, MCPTLSConfig, SecretVar } from "@/lib/types/mcp";
+import { getErrorMessage, usePreviewOpenAPISpecMutation } from "@/lib/store";
+import {
+	CreateMCPClientRequest,
+	MCPAuthType,
+	MCPConnectionType,
+	MCPOpenAPIPreviewResponse,
+	MCPTLSConfig,
+	SecretVar,
+} from "@/lib/types/mcp";
+import { mcpOpenAPIConfigSchema } from "@/lib/types/schemas";
 import { parseArrayFromText } from "@/lib/utils/array";
 import { useGetSCIMProvidersQuery } from "@enterprise/lib/store/apis/scimApi";
 import { Info } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { UseFormReturn } from "react-hook-form";
+import {
+	buildOpenAPIConfigPayload,
+	collapseToolSelection,
+	applyParsedPreview,
+	openAPIBaseUrlRequired,
+	specFingerprint,
+	supportedToolNames,
+	type OpenAPICredentialField,
+	type OpenAPISourceMode,
+} from "./mcpClientOpenApiUtils";
 import { OAuthAdvancedFields } from "./oauthAdvancedFields";
+import { OpenAPIPreviewPanel, type OpenAPIBaseUrlChoice } from "./openApiPreviewPanel";
+import { OpenAPISpecSource } from "./openApiSpecSource";
 import { SectionHeader } from "./sectionHeader";
 import { TLSConfigFields } from "./tlsConfigFields";
 import { TokenExchangeFields } from "./tokenExchangeFields";
@@ -76,7 +97,73 @@ export interface MCPClientFormSatellites {
 	setAllowedExtraHeadersText: (value: string) => void;
 	authScope: MCPAuthScope;
 	setAuthScope: (value: MCPAuthScope) => void;
+	openapi: MCPOpenAPISatellites;
 	reset: (init?: MCPClientFormSatellitesInit) => void;
+}
+
+/**
+ * UI-only state of the OpenAPI connection type: which source tab is active,
+ * the parse result the operation picker is built from, and the fingerprint of
+ * the source it was computed from (an edit afterwards marks it stale until the
+ * user parses again). The wire fields themselves live in react-hook-form under
+ * `openapi_config` and `tools_to_execute`.
+ */
+export interface MCPOpenAPISatellites {
+	sourceMode: OpenAPISourceMode;
+	setSourceMode: (mode: OpenAPISourceMode) => void;
+	fileName: string | null;
+	setFileName: (name: string | null) => void;
+	preview: MCPOpenAPIPreviewResponse | null;
+	setPreview: (preview: MCPOpenAPIPreviewResponse | null) => void;
+	previewedFingerprint: string | null;
+	setPreviewedFingerprint: (fingerprint: string | null) => void;
+	baseUrlChoice: OpenAPIBaseUrlChoice;
+	setBaseUrlChoice: (choice: OpenAPIBaseUrlChoice) => void;
+	parseError: string | null;
+	setParseError: (error: string | null) => void;
+	/** Starts a parse and returns its token; reset() and the next parse supersede it. */
+	beginParse: () => number;
+	/** Whether token belongs to the latest parse, so its response may be applied. */
+	isCurrentParse: (token: number) => boolean;
+	reset: () => void;
+}
+
+export function useMCPOpenAPISatellites(): MCPOpenAPISatellites {
+	const [sourceMode, setSourceMode] = useState<OpenAPISourceMode>("paste");
+	const [fileName, setFileName] = useState<string | null>(null);
+	const [preview, setPreview] = useState<MCPOpenAPIPreviewResponse | null>(null);
+	const [previewedFingerprint, setPreviewedFingerprint] = useState<string | null>(null);
+	const [baseUrlChoice, setBaseUrlChoice] = useState<OpenAPIBaseUrlChoice>("server");
+	const [parseError, setParseError] = useState<string | null>(null);
+	const parseGeneration = useRef(0);
+	const beginParse = useCallback(() => ++parseGeneration.current, []);
+	const isCurrentParse = useCallback((token: number) => token === parseGeneration.current, []);
+	const reset = useCallback(() => {
+		parseGeneration.current++;
+		setSourceMode("paste");
+		setFileName(null);
+		setPreview(null);
+		setPreviewedFingerprint(null);
+		setBaseUrlChoice("server");
+		setParseError(null);
+	}, []);
+	return {
+		sourceMode,
+		setSourceMode,
+		fileName,
+		setFileName,
+		preview,
+		setPreview,
+		previewedFingerprint,
+		setPreviewedFingerprint,
+		baseUrlChoice,
+		setBaseUrlChoice,
+		parseError,
+		setParseError,
+		beginParse,
+		isCurrentParse,
+		reset,
+	};
 }
 
 export interface MCPClientFormSatellitesInit {
@@ -96,17 +183,23 @@ export function useMCPClientFormSatellites(): MCPClientFormSatellites {
 	const [headerKeysInput, setHeaderKeysInput] = useState("");
 	const [allowedExtraHeadersText, setAllowedExtraHeadersText] = useState("");
 	const [authScope, setAuthScope] = useState<MCPAuthScope>("shared");
+	const openapi = useMCPOpenAPISatellites();
+	const resetOpenAPI = openapi.reset;
 
-	const reset = useCallback((init?: MCPClientFormSatellitesInit) => {
-		setArgsText(init?.argsText ?? "");
-		setEnvVars(init?.envVars ?? {});
-		setScopesText("");
-		setTokenExchangeScopesText("");
-		setResourceText("");
-		setHeaderKeysInput((init?.perUserHeaderKeys ?? []).join(", "));
-		setAllowedExtraHeadersText((init?.allowedExtraHeaders ?? []).join(", "));
-		setAuthScope(init?.authScope ?? "shared");
-	}, []);
+	const reset = useCallback(
+		(init?: MCPClientFormSatellitesInit) => {
+			setArgsText(init?.argsText ?? "");
+			setEnvVars(init?.envVars ?? {});
+			setScopesText("");
+			setTokenExchangeScopesText("");
+			setResourceText("");
+			setHeaderKeysInput((init?.perUserHeaderKeys ?? []).join(", "));
+			setAllowedExtraHeadersText((init?.allowedExtraHeaders ?? []).join(", "));
+			setAuthScope(init?.authScope ?? "shared");
+			resetOpenAPI();
+		},
+		[resetOpenAPI],
+	);
 
 	return {
 		argsText,
@@ -128,8 +221,18 @@ export function useMCPClientFormSatellites(): MCPClientFormSatellites {
 		setAllowedExtraHeadersText,
 		authScope,
 		setAuthScope,
+		openapi,
 		reset,
 	};
+}
+
+/** Whether the parsed preview still describes the document currently in the form. */
+export function isOpenAPIPreviewCurrent(data: CreateMCPClientRequest, openapi: MCPOpenAPISatellites): boolean {
+	if (!openapi.preview || !openapi.previewedFingerprint) return false;
+	return (
+		openapi.previewedFingerprint ===
+		specFingerprint(openapi.sourceMode, data.openapi_config?.spec, data.openapi_config?.spec_url, data.name)
+	);
 }
 
 /** Strips empty TLS config so we don't send `{}` to the server. */
@@ -252,6 +355,40 @@ export function validateMCPClientForm({
 		hasErrors = true;
 	}
 
+	if (connectionType === "openapi") {
+		const { openapi } = satellites;
+		const oc = data.openapi_config;
+		const parsed = mcpOpenAPIConfigSchema.safeParse({
+			...oc,
+			spec: openapi.sourceMode === "url" ? undefined : oc?.spec,
+			spec_url: openapi.sourceMode === "url" ? oc?.spec_url : undefined,
+		});
+		if (!parsed.success) {
+			for (const issue of parsed.error.issues) {
+				const field = issue.path[0];
+				if (field === "spec" || field === "spec_url" || field === "base_url") {
+					setError(`openapi_config.${field}`, { message: issue.message });
+				}
+			}
+			hasErrors = true;
+		}
+		if (!isOpenAPIPreviewCurrent(data, openapi)) {
+			onToast("Parse the spec first", "Parse the document so its operations can be reviewed before the server is created.");
+			hasErrors = true;
+		} else {
+			const supported = supportedToolNames(openapi.preview);
+			const selected = (data.tools_to_execute ?? []).filter((name) => supported.includes(name));
+			if (selected.length === 0) {
+				onToast("Select at least one operation", "Tick the operations this server should expose as tools.");
+				hasErrors = true;
+			}
+			if (openAPIBaseUrlRequired(openapi.baseUrlChoice, openapi.preview) && !oc?.base_url?.trim()) {
+				setError("openapi_config.base_url", { message: "Base URL is required" });
+				hasErrors = true;
+			}
+		}
+	}
+
 	// Mirrors the server's WhiteList validation, which rejects "*" alongside names.
 	// Skipped for STDIO, which hides the field and drops the value from the
 	// payload: text left over from a network transport must not block submit.
@@ -273,10 +410,15 @@ export function buildMCPClientPayload(data: CreateMCPClientRequest, satellites: 
 	const connectionType = data.connection_type;
 	const authType = data.auth_type;
 	const isStdio = connectionType === "stdio";
+	const isOpenAPI = connectionType === "openapi";
 
 	return {
 		...data,
-		connection_string: isStdio ? undefined : data.connection_string,
+		// An openapi server's upstream is openapi_config.base_url, not a connection URL.
+		connection_string: isStdio || isOpenAPI ? undefined : data.connection_string,
+		openapi_config: isOpenAPI
+			? buildOpenAPIConfigPayload(data.openapi_config, satellites.openapi.sourceMode, satellites.openapi.preview)
+			: undefined,
 		stdio_config: isStdio
 			? {
 					command: data.stdio_config?.command || "",
@@ -332,7 +474,11 @@ export function buildMCPClientPayload(data: CreateMCPClientRequest, satellites: 
 						authorization_server_url: data.token_exchange?.authorization_server_url?.trim() || undefined,
 					}
 				: undefined,
-		tools_to_execute: ["*"],
+		// Network transports expose every tool the server reports; an openapi
+		// server exposes the operations ticked in the preview.
+		tools_to_execute: isOpenAPI
+			? collapseToolSelection(data.tools_to_execute ?? [], supportedToolNames(satellites.openapi.preview))
+			: ["*"],
 		// Extra headers only ride on the network transports.
 		allowed_extra_headers: isStdio ? undefined : parseArrayFromText(satellites.allowedExtraHeadersText),
 	};
@@ -439,6 +585,92 @@ export function MCPClientFormFields({ form, satellites, headersValidationError, 
 	};
 
 	const isRemote = connectionType === "http" || connectionType === "sse";
+	const isOpenAPI = connectionType === "openapi";
+	// Auth and header sections apply to every transport that speaks HTTP to its
+	// target, which includes a synthesized openapi server's upstream API.
+	const hasNetworkAuth = isRemote || isOpenAPI;
+
+	const { openapi } = satellites;
+	const openapiConfig = watch("openapi_config");
+	const clientName = watch("name");
+	const selectedTools = watch("tools_to_execute") ?? [];
+	const openapiErrors = form.formState.errors.openapi_config as
+		| { spec?: { message?: string }; spec_url?: { message?: string }; base_url?: { message?: string } }
+		| undefined;
+	const [previewOpenAPISpec, { isLoading: isParsingOpenAPI }] = usePreviewOpenAPISpecMutation();
+	const openapiPreviewCurrent =
+		!!openapi.preview &&
+		openapi.previewedFingerprint === specFingerprint(openapi.sourceMode, openapiConfig?.spec, openapiConfig?.spec_url, clientName);
+
+	const setOpenAPIField = (field: "spec" | "spec_url" | "base_url", value: string) => {
+		setValue("openapi_config", { ...(openapiConfig ?? {}), [field]: value }, { shouldDirty: true });
+		clearErrors(`openapi_config.${field}`);
+	};
+
+	// The parse handler applies its response against the latest satellite state,
+	// not the render it started in.
+	const openapiRef = useRef(openapi);
+	openapiRef.current = openapi;
+
+	// A response is applied only if no newer parse or reset superseded it, and
+	// against the form values as they are when it arrives: the picker, base URL
+	// and credential inputs stay editable while a parse is in flight.
+	const handleParseOpenAPI = async () => {
+		const oc = openapiConfig;
+		const mode = openapi.sourceMode;
+		const requestedName = form.getValues("name")?.trim() || undefined;
+		const token = openapi.beginParse();
+		openapi.setParseError(null);
+		try {
+			const response = await previewOpenAPISpec(
+				mode === "url"
+					? {
+							spec_url: oc?.spec_url?.trim(),
+							base_url: openapi.baseUrlChoice === "custom" ? oc?.base_url?.trim() || undefined : undefined,
+							client_name: requestedName,
+						}
+					: {
+							spec: oc?.spec,
+							base_url: openapi.baseUrlChoice === "custom" ? oc?.base_url?.trim() || undefined : undefined,
+							client_name: requestedName,
+						},
+			).unwrap();
+			if (!openapiRef.current.isCurrentParse(token)) return;
+			const latest = form.getValues();
+			const next = applyParsedPreview(
+				{
+					selection: latest.tools_to_execute ?? [],
+					baseUrl: latest.openapi_config?.base_url ?? "",
+					baseUrlChoice: openapiRef.current.baseUrlChoice,
+					credentials: latest.openapi_config?.security_credentials ?? {},
+				},
+				openapiRef.current.preview,
+				response,
+			);
+			setValue("tools_to_execute", next.selection, { shouldDirty: true });
+			openapi.setBaseUrlChoice(next.baseUrlChoice);
+			setValue("openapi_config.base_url", next.baseUrl);
+			setValue("openapi_config.security_credentials", next.credentials);
+			openapi.setPreview(response);
+			// The fingerprint is the source and client name this response describes;
+			// an edit to either meanwhile shows the preview as stale, since the name
+			// shortens long tool names.
+			openapi.setPreviewedFingerprint(specFingerprint(mode, oc?.spec, oc?.spec_url, requestedName));
+			clearErrors(["openapi_config.spec", "openapi_config.spec_url", "openapi_config.base_url", "tools_to_execute"]);
+		} catch (error) {
+			if (!openapiRef.current.isCurrentParse(token)) return;
+			openapi.setParseError(getErrorMessage(error));
+		}
+	};
+
+	const handleOpenAPICredentialChange = (scheme: string, field: OpenAPICredentialField, value: SecretVar) => {
+		const current = openapiConfig?.security_credentials ?? {};
+		setValue(
+			"openapi_config.security_credentials",
+			{ ...current, [scheme]: { ...(current[scheme] ?? {}), [field]: value } },
+			{ shouldDirty: true },
+		);
+	};
 
 	return (
 		<>
@@ -581,6 +813,23 @@ export function MCPClientFormFields({ form, satellites, headersValidationError, 
 											setValue("headers", undefined);
 											setValue("oauth_config", undefined);
 										}
+										if (value === "openapi") {
+											// The upstream is the API described by the spec, not an
+											// MCP endpoint: no connection URL, and only the
+											// header-shaped auth types apply.
+											setValue("connection_string", undefined);
+											setValue("oauth_config", undefined);
+											setValue("token_exchange", undefined);
+											setValue("openapi_config", { spec: "", spec_url: "", base_url: "", security_credentials: {} });
+											setValue("tools_to_execute", []);
+											if (authKind === "oauth" || authKind === "token_exchange") {
+												setValue("auth_type", "none");
+											}
+										} else if (connectionType === "openapi") {
+											setValue("openapi_config", undefined);
+											setValue("tools_to_execute", undefined);
+											openapi.reset();
+										}
 										// needs_session_stickiness=false is rejected for
 										// non-http connection types; SSE/STDIO always keep
 										// a persistent connection regardless, so drop any
@@ -606,10 +855,17 @@ export function MCPClientFormFields({ form, satellites, headersValidationError, 
 										<SelectItem value="stdio" data-testid="connection-type-stdio">
 											STDIO
 										</SelectItem>
+										<SelectItem value="openapi" data-testid="connection-type-openapi">
+											OpenAPI (REST API spec)
+										</SelectItem>
 									</SelectContent>
 								</Select>
 								{!lockConnection && (
-									<p className="text-muted-foreground text-xs">Connection type and authentication settings cannot be changed later.</p>
+									<p className="text-muted-foreground text-xs">
+										{isOpenAPI
+											? "Bifrost builds an MCP server from the document: every supported operation becomes a tool whose call is sent to the API. Connection type and authentication settings cannot be changed later."
+											: "Connection type and authentication settings cannot be changed later."}
+									</p>
 								)}
 								<FormMessage />
 							</FormItem>
@@ -639,7 +895,39 @@ export function MCPClientFormFields({ form, satellites, headersValidationError, 
 									</FormItem>
 								)}
 							/>
+						</>
+					)}
 
+					{isOpenAPI && (
+						<div className="space-y-2">
+							<FormLabel>OpenAPI document</FormLabel>
+							<OpenAPISpecSource
+								mode={openapi.sourceMode}
+								onModeChange={(mode) => {
+									openapi.setSourceMode(mode);
+									openapi.setParseError(null);
+								}}
+								specText={openapiConfig?.spec ?? ""}
+								onSpecTextChange={(text) => setOpenAPIField("spec", text)}
+								specUrl={openapiConfig?.spec_url ?? ""}
+								onSpecUrlChange={(url) => setOpenAPIField("spec_url", url)}
+								fileName={openapi.fileName}
+								onFileSelected={(file, text) => {
+									openapi.setFileName(file.name);
+									setOpenAPIField("spec", text);
+								}}
+								onParse={handleParseOpenAPI}
+								isParsing={isParsingOpenAPI}
+								parseError={openapi.parseError}
+								isStale={!!openapi.preview && !openapiPreviewCurrent}
+								specError={openapiErrors?.spec?.message}
+								specUrlError={openapiErrors?.spec_url?.message}
+							/>
+						</div>
+					)}
+
+					{hasNetworkAuth && (
+						<>
 							{/* Auth Type */}
 							<FormItem className="w-full">
 								<FormLabel>Authentication Type</FormLabel>
@@ -656,12 +944,17 @@ export function MCPClientFormFields({ form, satellites, headersValidationError, 
 										<SelectItem value="headers" data-testid="auth-type-headers">
 											Headers
 										</SelectItem>
-										<SelectItem value="oauth" data-testid="auth-type-oauth">
-											OAuth 2.0
-										</SelectItem>
+										{/* A synthesized openapi server has no MCP handshake to run an
+										    OAuth or token-exchange flow against; the API's own security
+										    schemes are configured from the parsed document instead. */}
+										{!isOpenAPI && (
+											<SelectItem value="oauth" data-testid="auth-type-oauth">
+												OAuth 2.0
+											</SelectItem>
+										)}
 										{/* Also rendered when it is already the selected value, so the
 										    trigger shows the real auth type rather than a placeholder. */}
-										{((IS_ENTERPRISE && idpConfigured) || tokenExchangeUnavailable) && (
+										{!isOpenAPI && ((IS_ENTERPRISE && idpConfigured) || tokenExchangeUnavailable) && (
 											<SelectItem value="token_exchange" data-testid="auth-type-token-exchange">
 												Token Exchange (On-Behalf-Of)
 											</SelectItem>
@@ -709,13 +1002,41 @@ export function MCPClientFormFields({ form, satellites, headersValidationError, 
 				</div>
 			</div>
 
-			{isRemote && (
+			{isOpenAPI && openapi.preview && (
+				<>
+					<DottedSeparator />
+					<OpenAPIPreviewPanel
+						preview={openapi.preview}
+						baseUrlChoice={openapi.baseUrlChoice}
+						onBaseUrlChoiceChange={openapi.setBaseUrlChoice}
+						baseUrl={openapiConfig?.base_url ?? ""}
+						onBaseUrlChange={(url) => setOpenAPIField("base_url", url)}
+						baseUrlError={openapiErrors?.base_url?.message}
+						credentials={openapiConfig?.security_credentials ?? {}}
+						onCredentialChange={handleOpenAPICredentialChange}
+						selectedTools={selectedTools}
+						onSelectedToolsChange={(names) => {
+							setValue("tools_to_execute", names, { shouldDirty: true });
+							clearErrors("tools_to_execute");
+						}}
+					/>
+				</>
+			)}
+
+			{hasNetworkAuth && (
 				<>
 					{authType !== "per_user_headers" && (
 						<>
 							<DottedSeparator />
 							<div className="space-y-4">
-								<SectionHeader title="Headers" description="Static headers sent with every request to this server." />
+								<SectionHeader
+									title="Headers"
+									description={
+										isOpenAPI
+											? "Static headers sent with every request to the API, alongside the credentials above."
+											: "Static headers sent with every request to this server."
+									}
+								/>
 								<FormField
 									control={control}
 									name="headers"

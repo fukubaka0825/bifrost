@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { MCPOpenAPIPreviewResponse, MCPOpenAPISecurityScheme } from "@/lib/types/mcp";
 import {
+	applyParsedPreview,
+	openAPIBaseUrlRequired,
 	buildOpenAPIConfigPayload,
 	collapseToolSelection,
 	detectSpecLanguage,
@@ -9,6 +11,7 @@ import {
 	isSpecTooLarge,
 	mergePreviewRows,
 	pruneCredentials,
+	readUploadedSpec,
 	reconcileToolSelection,
 	securitySchemeToInputs,
 	specFingerprint,
@@ -237,5 +240,104 @@ describe("formatting helpers", () => {
 		);
 		expect(summarizeSpecSource({ spec_url: "https://x/openapi.json", operation_count: 1 })).toBe("https://x/openapi.json · 1 operation");
 		expect(summarizeSpecSource(undefined)).toBe("-");
+	});
+});
+describe("applyParsedPreview", () => {
+	const twoServers: MCPOpenAPIPreviewResponse = {
+		...preview,
+		servers: ["https://petstore.example.com/v1", "https://staging.petstore.example.com/v1"],
+		base_url: "https://petstore.example.com/v1",
+	};
+	it("keeps a server the user picked from the list when the re-parsed document still lists it", () => {
+		const next = applyParsedPreview(
+			{ selection: ["listPets"], baseUrl: "https://staging.petstore.example.com/v1", baseUrlChoice: "server", credentials: {} },
+			twoServers,
+			twoServers,
+		);
+		expect(next.baseUrl).toBe("https://staging.petstore.example.com/v1");
+		expect(next.baseUrlChoice).toBe("server");
+	});
+	it("falls back to the document default when the picked server is gone", () => {
+		const next = applyParsedPreview(
+			{ selection: [], baseUrl: "https://removed.example.com", baseUrlChoice: "server", credentials: {} },
+			null,
+			twoServers,
+		);
+		expect(next.baseUrl).toBe("https://petstore.example.com/v1");
+	});
+	it("keeps a custom base URL and reconciles the latest selection", () => {
+		const next = applyParsedPreview(
+			{
+				selection: ["listPets"],
+				baseUrl: "https://mine.example.com",
+				baseUrlChoice: "custom",
+				credentials: { ApiKeyAuth: { value: { value: "k" } }, Gone: { value: { value: "x" } } },
+			},
+			preview,
+			preview,
+		);
+		expect(next.baseUrl).toBe("https://mine.example.com");
+		expect(next.selection).toEqual(["listPets"]);
+		expect(next.credentials).toEqual({ ApiKeyAuth: { value: { value: "k" } } });
+	});
+});
+
+describe("readUploadedSpec", () => {
+	const file = (size: number, text: () => Promise<string>) => ({ size, text });
+	it("reads a document", async () => {
+		expect(await readUploadedSpec(file(10, async () => "openapi: 3.0.0"))).toEqual({ text: "openapi: 3.0.0", error: null });
+	});
+	it("refuses an oversized file without reading it", async () => {
+		const result = await readUploadedSpec(
+			file(6 * 1024 * 1024, async () => {
+				throw new Error("must not read");
+			}),
+		);
+		expect(result.error).toContain("exceeds");
+	});
+	it("says an empty file is empty, not too large", async () => {
+		const result = await readUploadedSpec(file(0, async () => ""));
+		expect(result.error).toContain("empty");
+		expect(result.error).not.toContain("exceeds");
+	});
+	it("reports a failed read instead of rejecting", async () => {
+		const result = await readUploadedSpec(
+			file(10, async () => {
+				throw new Error("permission denied");
+			}),
+		);
+		expect(result.text).toBe("");
+		expect(result.error).toContain("permission denied");
+	});
+});
+describe("document and operation servers", () => {
+	const opServers: MCPOpenAPIPreviewResponse = { ...preview, servers: [], base_url: undefined, operation_servers: true };
+	it("needs no base URL when every operation declares its own server", () => {
+		expect(openAPIBaseUrlRequired("server", opServers)).toBe(false);
+		expect(openAPIBaseUrlRequired("custom", opServers)).toBe(true);
+		expect(openAPIBaseUrlRequired("server", { ...preview, servers: [] })).toBe(true);
+		expect(openAPIBaseUrlRequired("server", preview)).toBe(false);
+	});
+	it("keeps the document-servers choice after parsing an operation-servers document", () => {
+		const next = applyParsedPreview({ selection: [], baseUrl: "", baseUrlChoice: "server", credentials: {} }, null, opServers);
+		expect(next.baseUrlChoice).toBe("server");
+		expect(next.baseUrl).toBe("");
+	});
+	it("does not pin the document's default server as an explicit base URL", () => {
+		const payload = buildOpenAPIConfigPayload({ spec: "x", base_url: "https://petstore.example.com/v1" }, "paste", preview);
+		expect(payload.base_url).toBe("");
+		const custom = buildOpenAPIConfigPayload({ spec: "x", base_url: "https://staging.example.com" }, "paste", preview);
+		expect(custom.base_url).toBe("https://staging.example.com");
+	});
+	it("keeps a chosen server that is not the document's first, even after a re-parse echoes it back", () => {
+		const reparsed: MCPOpenAPIPreviewResponse = {
+			...preview,
+			servers: ["https://prod.example.com", "https://staging.example.com"],
+			base_url: "https://staging.example.com",
+		};
+		expect(buildOpenAPIConfigPayload({ spec: "x", base_url: "https://staging.example.com" }, "paste", reparsed).base_url).toBe(
+			"https://staging.example.com",
+		);
+		expect(buildOpenAPIConfigPayload({ spec: "x", base_url: "https://prod.example.com/" }, "paste", reparsed).base_url).toBe("");
 	});
 });

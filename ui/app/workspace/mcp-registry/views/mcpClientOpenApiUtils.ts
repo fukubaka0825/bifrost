@@ -219,13 +219,24 @@ export function buildOpenAPIConfigPayload(
 	} else {
 		out.spec_url = "";
 	}
-	out.base_url = cfg?.base_url?.trim() ?? "";
+	// The document's default server (its first absolute one) is sent as ""
+	// rather than pinned: the backend resolves the same default, operation-level
+	// servers keep applying, and on update "" clears an earlier override. The
+	// preview's base_url is not the default: a re-parse echoes a chosen server.
+	const base = cfg?.base_url?.trim() ?? "";
+	const documentDefault = preview?.servers?.find((srv) => /^https?:\/\/[^/]/i.test(srv));
+	const isDocumentDefault = !!documentDefault && trimSlash(documentDefault) === trimSlash(base);
+	out.base_url = base && !isDocumentDefault ? base : "";
 	if (cfg?.security_credentials !== undefined) {
 		out.security_credentials = pruneCredentials(cfg.security_credentials, preview?.security_schemes) ?? {};
 	}
 	if (cfg?.include_deprecated) out.include_deprecated = true;
 	if (cfg?.max_response_bytes) out.max_response_bytes = cfg.max_response_bytes;
 	return out;
+}
+
+function trimSlash(url: string): string {
+	return url.replace(/\/+$/, "");
 }
 
 export function formatBytes(n: number | undefined): string {
@@ -253,4 +264,78 @@ export function summarizeSpecSource(cfg: MCPOpenAPIConfig | undefined): string {
 	if (cfg.spec_size) parts.push(formatBytes(cfg.spec_size));
 	if (cfg.operation_count !== undefined) parts.push(`${cfg.operation_count} operation${cfg.operation_count === 1 ? "" : "s"}`);
 	return parts.join(" · ");
+}
+/** The form values a parse response is applied to. */
+export interface OpenAPIParseState {
+	selection: string[];
+	baseUrl: string;
+	baseUrlChoice: "server" | "custom";
+	credentials: Record<string, MCPOpenAPICredential>;
+}
+
+/**
+ * Applies a parse (preview) response to the form: the tool selection is
+ * reconciled against the previous preview, the base URL follows the document
+ * unless the user typed a custom one or picked a server the document still
+ * lists, and credentials for schemes the document no longer declares are
+ * dropped. current must be read when the response arrives, not when the parse
+ * started, so edits made while it was in flight survive.
+ */
+export function applyParsedPreview(
+	current: OpenAPIParseState,
+	previousPreview: MCPOpenAPIPreviewResponse | null | undefined,
+	response: MCPOpenAPIPreviewResponse,
+): OpenAPIParseState {
+	const nextSupported = supportedToolNames(response);
+	const selection = previousPreview
+		? reconcileToolSelection(current.selection, supportedToolNames(previousPreview), nextSupported)
+		: nextSupported;
+	let { baseUrl, baseUrlChoice } = current;
+	const keepCustom = current.baseUrlChoice === "custom" && !!current.baseUrl.trim();
+	const keepPicked = current.baseUrlChoice === "server" && !!current.baseUrl && !!response.servers?.includes(current.baseUrl);
+	if (!keepCustom && !keepPicked) {
+		if (response.operation_servers && !response.base_url) {
+			// Every operation carries its own server: no base URL, nothing to pick.
+			baseUrlChoice = "server";
+			baseUrl = "";
+		} else if (response.base_url && response.servers?.includes(response.base_url)) {
+			baseUrlChoice = "server";
+			baseUrl = response.base_url;
+		} else {
+			baseUrlChoice = "custom";
+			baseUrl = response.base_url ?? "";
+		}
+	}
+	const declared = new Set((response.security_schemes ?? []).filter((scheme) => scheme.supported).map((scheme) => scheme.name));
+	const credentials: Record<string, MCPOpenAPICredential> = {};
+	for (const [name, cred] of Object.entries(current.credentials)) {
+		if (declared.has(name)) credentials[name] = cred;
+	}
+	return { selection, baseUrl, baseUrlChoice, credentials };
+}
+
+/** Reads an uploaded spec file, returning its text or the error to show. */
+export async function readUploadedSpec(file: {
+	size: number;
+	text: () => Promise<string>;
+}): Promise<{ text: string; error: string | null }> {
+	if (isSpecTooLarge(file.size)) {
+		return { text: "", error: `The file exceeds the ${formatBytes(OPENAPI_MAX_SPEC_BYTES)} limit for OpenAPI documents.` };
+	}
+	let text: string;
+	try {
+		text = await file.text();
+	} catch (error) {
+		return { text: "", error: `The file could not be read: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	return { text, error: text.trim() ? null : "The file is empty." };
+}
+/**
+ * Whether the form must have a base URL before the server can be created or
+ * replaced: a custom choice needs its value, and so does a document with no
+ * top-level server, unless every operation declares its own.
+ */
+export function openAPIBaseUrlRequired(choice: "server" | "custom", preview: MCPOpenAPIPreviewResponse | null | undefined): boolean {
+	if (choice === "custom") return true;
+	return (preview?.servers?.length ?? 0) === 0 && !preview?.operation_servers;
 }
