@@ -527,6 +527,152 @@ func TestCheckPrivateNetworkLiteral(t *testing.T) {
 	}
 }
 
+// TestAllowlistedPrivateDialContextPermitsListedPrivateTargets pins the MCP
+// OAuth allowlist policy: a private address passes only when the allowlist
+// names it (by hostname or CIDR), public addresses always pass, and every
+// validated address is tried in turn so a dual-stack "localhost" still reaches
+// an IPv4-only server.
+func TestAllowlistedPrivateDialContextPermitsListedPrivateTargets(t *testing.T) {
+	al, err := NewAllowlist([]string{"mcp.internal", "10.1.0.0/16"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	allow := func() *Allowlist { return al }
+	dialErr := errors.New("stop before real network")
+	for _, tc := range []struct {
+		host string
+		ips  []string
+		want []string
+	}{
+		{"mcp.internal", []string{"::1", "127.0.0.1"}, []string{"[::1]:443", "127.0.0.1:443"}},
+		{"other.example", []string{"10.1.2.3"}, []string{"10.1.2.3:443"}},
+		{"public.example", []string{"93.184.216.34"}, []string{"93.184.216.34:443"}},
+	} {
+		var resolved []net.IP
+		for _, ip := range tc.ips {
+			resolved = append(resolved, net.ParseIP(ip))
+		}
+		var dialed []string
+		dial := allowlistedPrivateDialContext(&fakeResolver{ips: resolved}, func(_ context.Context, _, addr string) (net.Conn, error) {
+			dialed = append(dialed, addr)
+			return nil, dialErr
+		}, allow)
+		if _, err := dial(context.Background(), "tcp", net.JoinHostPort(tc.host, "443")); !errors.Is(err, dialErr) {
+			t.Fatalf("%s: expected sentinel dial error, got %v", tc.host, err)
+		}
+		if strings.Join(dialed, ",") != strings.Join(tc.want, ",") {
+			t.Fatalf("%s: dialed %v, want %v", tc.host, dialed, tc.want)
+		}
+	}
+}
+
+// TestAllowlistedPrivateDialContextRefusesUnlistedAndMetadata proves the
+// allowlist only widens the public policy by the entries it names, and never
+// reaches link-local or cloud metadata addresses even when an entry covers
+// them (a hostname entry can resolve anywhere).
+func TestAllowlistedPrivateDialContextRefusesUnlistedAndMetadata(t *testing.T) {
+	al, err := NewAllowlist([]string{"mcp.internal"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, tc := range []struct {
+		name  string
+		allow *Allowlist
+		host  string
+		ip    string
+		want  string
+	}{
+		{"unlisted private", al, "other.internal", "10.0.0.5", "blocked connection to non-public address"},
+		{"nil allowlist", nil, "mcp.internal", "127.0.0.1", "blocked connection to non-public address"},
+		{"listed name resolving to link-local", al, "mcp.internal", "169.254.169.254", "blocked connection to link-local address"},
+		{"listed name resolving to metadata", al, "mcp.internal", "100.100.100.200", "blocked connection to cloud metadata endpoint"},
+		{"listed name resolving to unspecified", al, "mcp.internal", "0.0.0.0", "blocked connection to unspecified address"},
+	} {
+		allow := tc.allow
+		dial := allowlistedPrivateDialContext(&fakeResolver{ips: []net.IP{net.ParseIP(tc.ip)}}, func(_ context.Context, _, _ string) (net.Conn, error) {
+			t.Fatalf("%s: dial must not be reached", tc.name)
+			return nil, nil
+		}, func() *Allowlist { return allow })
+		if _, err := dial(context.Background(), "tcp", net.JoinHostPort(tc.host, "443")); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: expected %q, got %v", tc.name, tc.want, err)
+		}
+	}
+}
+
+// TestAllowlistedPrivateDialContextReadsAllowlistPerDial proves a hot-reloaded
+// allowlist applies to the next dial without rebuilding the dialer.
+func TestAllowlistedPrivateDialContextReadsAllowlistPerDial(t *testing.T) {
+	var current atomic.Pointer[Allowlist]
+	dialErr := errors.New("stop before real network")
+	dial := allowlistedPrivateDialContext(&fakeResolver{ips: []net.IP{net.ParseIP("10.0.0.5")}}, func(_ context.Context, _, _ string) (net.Conn, error) {
+		return nil, dialErr
+	}, current.Load)
+	if _, err := dial(context.Background(), "tcp", "mcp.internal:443"); err == nil || errors.Is(err, dialErr) {
+		t.Fatalf("expected refusal before the allowlist names the host, got %v", err)
+	}
+	al, err := NewAllowlist([]string{"mcp.internal"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	current.Store(al)
+	if _, err := dial(context.Background(), "tcp", "mcp.internal:443"); !errors.Is(err, dialErr) {
+		t.Fatalf("expected the reloaded allowlist to permit the dial, got %v", err)
+	}
+}
+
+func TestCheckAllowlistedPrivateLiteral(t *testing.T) {
+	al, err := NewAllowlist([]string{"127.0.0.1", "10.0.0.0/8", "169.254.169.254"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, host := range []string{"127.0.0.1", "10.2.3.4", "93.184.216.34", "mcp.invalid"} {
+		if err := CheckAllowlistedPrivateLiteral(host, al); err != nil {
+			t.Fatalf("%s: expected permitted, got %v", host, err)
+		}
+	}
+	for _, tc := range []struct {
+		host  string
+		allow *Allowlist
+		want  string
+	}{
+		{"192.168.1.1", al, "blocked connection to non-public address"},
+		{"127.0.0.1", nil, "blocked connection to non-public address"},
+		{"169.254.169.254", al, "blocked connection to link-local address"},
+	} {
+		if err := CheckAllowlistedPrivateLiteral(tc.host, tc.allow); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: expected %q, got %v", tc.host, tc.want, err)
+		}
+	}
+}
+
+func TestValidatePrivateTargetAllowlist(t *testing.T) {
+	al, err := ValidatePrivateTargetAllowlist([]string{"localhost", "127.0.0.1", "::1", "10.0.0.0/8", "mcp.corp.internal"})
+	if err != nil {
+		t.Fatalf("expected valid entries to pass, got %v", err)
+	}
+	if !al.Permits("localhost", net.ParseIP("127.0.0.1")) {
+		t.Fatal("expected localhost to be permitted")
+	}
+	for _, entry := range []string{
+		"169.254.169.254",
+		"169.254.0.0/16",
+		"fe80::1",
+		"0.0.0.0",
+		"0.0.0.0/0",
+		"::/0",
+		"100.100.100.200",
+		"100.64.0.0/10",
+		"fd00:ec2::254",
+		"metadata.google.internal",
+		"metadata",
+		"http://localhost:3000",
+	} {
+		if _, err := ValidatePrivateTargetAllowlist([]string{entry}); err == nil {
+			t.Fatalf("%s: expected the entry to be refused", entry)
+		}
+	}
+}
+
 // TestPrivateNetworkDialContextBlocksMetadataEndpoints proves the direct
 // dialer refuses the non-link-local metadata endpoints before any dial.
 func TestPrivateNetworkDialContextBlocksMetadataEndpoints(t *testing.T) {

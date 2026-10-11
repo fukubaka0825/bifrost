@@ -1137,6 +1137,9 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	if err := validateClientConfig(config.ClientConfig); err != nil {
 		return nil, err
 	}
+	if err := ApplyMCPOAuthPrivateAllowlist(config.ClientConfig.MCPOAuthPrivateAllowlist); err != nil {
+		return nil, fmt.Errorf("mcp_oauth_private_allowlist: %w", err)
+	}
 	config.SetHeaderMatcher(NewHeaderMatcher(config.ClientConfig.HeaderFilterConfig))
 	// 4a. Global proxy (store only). Loaded before providers so the first
 	// GetConfigForProvider already sees it for providers that inherit it.
@@ -1446,6 +1449,30 @@ func validateClientConfig(cc *configstore.ClientConfig) error {
 			return fmt.Errorf("oauth2_server_config.issuer_url must be set to a non-empty value when mcp_server_auth_mode is oauth or both")
 		}
 	}
+	// The allowlist relaxes an SSRF guard, so a typo must stop startup rather
+	// than leave an entry that silently matches nothing.
+	if _, err := network.ValidatePrivateTargetAllowlist(cc.MCPOAuthPrivateAllowlist); err != nil {
+		return fmt.Errorf("mcp_oauth_private_allowlist: %w", err)
+	}
+	return nil
+}
+
+// ApplyMCPOAuthPrivateAllowlist publishes entries as the private-target
+// allowlist the MCP OAuth chain (discovery, registration, token requests)
+// uses for clients registered with admin auth. Entries are validated where
+// they are accepted (validateClientConfig, PUT /api/config); if they still
+// fail to parse here the allowlist is cleared rather than left stale.
+func ApplyMCPOAuthPrivateAllowlist(entries []string) error {
+	if len(entries) == 0 {
+		oauth2.SetPrivateTargetAllowlist(nil)
+		return nil
+	}
+	allow, err := network.ValidatePrivateTargetAllowlist(entries)
+	if err != nil {
+		oauth2.SetPrivateTargetAllowlist(nil)
+		return err
+	}
+	oauth2.SetPrivateTargetAllowlist(allow)
 	return nil
 }
 
@@ -1667,6 +1694,10 @@ func applyToolManagerToClientConfig(cc *configstore.ClientConfig, tm *schemas.MC
 	// tool_manager_config.code_mode_limits keeps it instead of resetting it.
 	if tm.CodeModeLimits != nil {
 		cc.MCPCodeModeLimits = tm.CodeModeLimits
+	}
+	// Same for client_config.mcp_oauth_private_allowlist.
+	if tm.OAuthPrivateAllowlist != nil {
+		cc.MCPOAuthPrivateAllowlist = tm.OAuthPrivateAllowlist
 	}
 }
 
@@ -2599,6 +2630,7 @@ func applyMCPGlobalSettingsToClientConfig(ctx context.Context, config *Config, m
 	mcpCfg.ToolManagerConfig.MaxInstructionsPerClient = config.ClientConfig.MCPMaxInstructionsPerClient
 	mcpCfg.ToolManagerConfig.MaxInstructionsTotal = config.ClientConfig.MCPMaxInstructionsTotal
 	mcpCfg.ToolManagerConfig.CodeModeLimits = config.ClientConfig.MCPCodeModeLimits
+	mcpCfg.ToolManagerConfig.OAuthPrivateAllowlist = config.ClientConfig.MCPOAuthPrivateAllowlist
 
 	// ToolSyncInterval is declared under the file's mcp section rather than
 	// client_config, so it sits outside the hash-driven client config load and

@@ -22189,6 +22189,63 @@ func TestCodeModeLimitsFromConfigFile(t *testing.T) {
 	assert.Equal(t, fromToolManager, mcpCfg.ToolManagerConfig.CodeModeLimits, "bifrost.Init must receive the configured limits")
 }
 
+// TestOAuthPrivateAllowlistFromConfigFile pins how the MCP OAuth private-target
+// allowlist flows from config.json: tool_manager_config.oauth_private_allowlist
+// wins when set and an omitted one keeps client_config's, the value round-trips
+// through the store into bifrost.Init's tool manager config, it is part of the
+// reconciliation hash, and an entry the policy can never honor stops startup.
+func TestOAuthPrivateAllowlistFromConfigFile(t *testing.T) {
+	fromClientConfig := []string{"10.0.0.0/8"}
+	fromToolManager := []string{"localhost", "127.0.0.1"}
+
+	cc := &configstore.ClientConfig{MCPOAuthPrivateAllowlist: fromClientConfig}
+	applyToolManagerToClientConfig(cc, &schemas.MCPToolManagerConfig{MaxAgentDepth: 5})
+	assert.Equal(t, fromClientConfig, cc.MCPOAuthPrivateAllowlist, "a tool_manager_config without oauth_private_allowlist must keep client_config's")
+
+	applyToolManagerToClientConfig(cc, &schemas.MCPToolManagerConfig{MaxAgentDepth: 5, OAuthPrivateAllowlist: fromToolManager})
+	assert.Equal(t, fromToolManager, cc.MCPOAuthPrivateAllowlist, "tool_manager_config.oauth_private_allowlist must win when set")
+
+	initTestLogger()
+	store := createTestSQLiteConfigStore(t, t.TempDir())
+	ctx := context.Background()
+	require.NoError(t, store.UpdateClientConfig(ctx, cc))
+	persisted, err := store.GetClientConfig(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, fromToolManager, persisted.MCPOAuthPrivateAllowlist, "the allowlist must round-trip through the store")
+	mcpFromStore, err := store.GetMCPConfig(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, mcpFromStore.ToolManagerConfig)
+	assert.Equal(t, fromToolManager, mcpFromStore.ToolManagerConfig.OAuthPrivateAllowlist)
+
+	cfg := &Config{ConfigStore: store, ClientConfig: cc}
+	mcpCfg := &schemas.MCPConfig{}
+	applyMCPGlobalSettingsToClientConfig(ctx, cfg, mcpCfg, false)
+	require.NotNil(t, mcpCfg.ToolManagerConfig)
+	assert.Equal(t, fromToolManager, mcpCfg.ToolManagerConfig.OAuthPrivateAllowlist)
+
+	base := &configstore.ClientConfig{}
+	baseHash, err := base.GenerateClientConfigHashWithToolManager(&schemas.MCPToolManagerConfig{})
+	require.NoError(t, err)
+	listedHash, err := base.GenerateClientConfigHashWithToolManager(&schemas.MCPToolManagerConfig{OAuthPrivateAllowlist: fromToolManager})
+	require.NoError(t, err)
+	reorderedHash, err := base.GenerateClientConfigHashWithToolManager(&schemas.MCPToolManagerConfig{OAuthPrivateAllowlist: []string{"127.0.0.1", "localhost"}})
+	require.NoError(t, err)
+	assert.NotEqual(t, baseHash, listedHash, "editing the allowlist in config.json must re-sync it")
+	assert.Equal(t, listedHash, reorderedHash, "entry order must not churn the hash")
+	clientHash, err := (&configstore.ClientConfig{MCPOAuthPrivateAllowlist: fromClientConfig}).GenerateClientConfigHash()
+	require.NoError(t, err)
+	emptyHash, err := base.GenerateClientConfigHash()
+	require.NoError(t, err)
+	assert.NotEqual(t, emptyHash, clientHash)
+
+	require.NoError(t, validateClientConfig(&configstore.ClientConfig{MCPOAuthPrivateAllowlist: fromToolManager}))
+	for _, entry := range []string{"169.254.169.254", "0.0.0.0/0", "http://localhost:3000"} {
+		err := validateClientConfig(&configstore.ClientConfig{MCPOAuthPrivateAllowlist: []string{entry}})
+		require.Error(t, err, entry)
+		assert.Contains(t, err.Error(), "mcp_oauth_private_allowlist")
+	}
+}
+
 // TestGetMCPConfig_CarriesGlobalToolSyncInterval pins that the MCP config
 // loaded from the store carries the client-config-backed global tool sync
 // interval, so a boot without an mcp section in config.json still hands
